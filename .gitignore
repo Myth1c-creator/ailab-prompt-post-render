@@ -1,0 +1,10 @@
+node_modules/
+out/
+parts/
+public/hook/
+logs/
+info.json
+list.txt
+video.mp4
+__pycache__/
+.env

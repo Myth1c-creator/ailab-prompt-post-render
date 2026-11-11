@@ -1,0 +1,260 @@
+# Cloud render of AI LAB "prompt -> post" in the PRIVATE repo Myth1c-creator/ailab-prompt-post (from ailab-aura-intro):
+#   1. hook  : the whole 3D picture (Remotion + three.js, composition Film3D, 1107 frames) as JPEG frame chunks
+#   2. chunk : the kinetic layer over it (scenario-kinetic-film engine: one-word captions, local bloom, grain) in chunks
+#   3. join  : join, mux the mix (kinetic/audio/master.wav), the checks and the stills:
+#              finish916.py (the skill's gates: frames, size, H.264 level, decode, loudness, dynamism before the end card),
+#              tools/qa_gates.py (technique, -14 LUFS / TP, black and frozen stretches, dynamism, margin-guide stills),
+#              cdp.mjs check (captions >= 170 px from the edges, no caption under the same word), check_text3d.py (the 3D
+#              words: >= 170 px at rest and at the slam peak, sizes, DUP), one 540x960 still per scene.
+# Chunks and the result travel as assets of a per-run prerelease (run-<id>), not as artifacts (the account's artifact
+# quota). Nothing is rendered on the user's PC. Run (workflow_dispatch only):
+#   final    gh workflow run kinetic.yml -f res=1080          -> release run-<id>, asset "ailab_prompt_post-1080.tar"
+#   preview  gh workflow run kinetic.yml -f res=540           (half size, same checks)
+#   reuse    -f hook_run=<run id> renders only the kinetic layer over the 3D frames of an earlier run of the same res
+#   timing   -f upto=<frames> renders only frames 0..upto (no checks)
+name: kinetic
+
+on:
+  workflow_dispatch:
+    inputs:
+      res:
+        default: "1080"
+        type: choice
+        options: ["1080", "540"]
+      chunks:
+        default: "10"
+      hook_frames:
+        description: "frames of the 3D composition"
+        default: "1107"
+      hook_step:
+        description: "3D frames per job (56 = 20 jobs: the public repo starts at most 20 jobs of a matrix)"
+        default: "56"
+      hook_comp:
+        default: "Film3D"
+      hook_run:
+        description: "run id of an earlier run whose 3D frames to reuse (empty = render them now)"
+        default: ""
+      upto:
+        description: "render only frames 0..upto (a timing test, no checks; empty = whole film)"
+        default: ""
+      end_card:
+        description: "seconds where the end card starts (the dynamism gates stop there): the CTA is complete (PRO VÍC NOVINEK written, last sweep 16.133)"
+        default: "16.133"
+
+permissions:
+  actions: read
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CHROME: /usr/bin/google-chrome
+  NAME: ailab_prompt_post
+  AUDIO: kinetic/audio/master.wav
+  # chunks travel as assets of a per-run release: the account's artifact storage quota is full
+  GH_TOKEN: ${{ github.token }}
+  TAG: run-${{ github.run_id }}
+  # public repo: media, mix and texts come in assets.tar.gpg, and every release asset is encrypted with the same key
+  ASSETS_KEY: ${{ secrets.ASSETS_KEY }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      hook: ${{ steps.m.outputs.hook }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack the encrypted assets
+        run: gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 3 -d assets.tar.gpg 3<<<"$ASSETS_KEY" | tar x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: m
+        run: |
+          node kinetic/scripts/cdp.mjs info info.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          info = json.load(open("info.json"))
+          total = round(info["dur"] * info["fps"])
+          if "${{ inputs.upto }}": total = min(total, int("${{ inputs.upto }}"))
+          n = int("${{ inputs.chunks }}")
+          step = -(-total // n)
+          parts = [{"i": i, "a": a, "b": min(a + step, total)} for i, a in enumerate(range(0, total, step))]
+          print("matrix=" + json.dumps({"include": parts}))
+          hook = min(int("${{ inputs.hook_frames }}"), total) or 1
+          hs = int("${{ inputs.hook_step }}")
+          print("hook=" + json.dumps({"include": [{"i": i, "a": a, "b": min(a + hs, hook) - 1} for i, a in enumerate(range(0, hook, hs))]}))
+          PY
+      - name: Release for this run's chunks
+        run: gh release create "$TAG" --target "$GITHUB_SHA" --prerelease --title "$TAG" --notes "render chunks of run ${{ github.run_id }}" -R "$GITHUB_REPOSITORY"
+
+  hook:
+    needs: plan
+    if: inputs.hook_run == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.plan.outputs.hook) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack the encrypted assets
+        run: gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 3 -d assets.tar.gpg 3<<<"$ASSETS_KEY" | tar x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Cache node_modules (Remotion + its Chrome)
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('package.json') }}
+      - name: Remotion + Chrome
+        timeout-minutes: 12
+        run: |
+          [ -d node_modules/@remotion ] || npm install --no-audit --no-fund
+          npx remotion browser ensure
+      - name: Render 3D frames ${{ matrix.a }}-${{ matrix.b }}
+        run: |
+          start=$(date +%s)
+          scale=$(case "${{ inputs.res }}" in 540) echo 0.5;; *) echo 1;; esac)
+          npx remotion render ${{ inputs.hook_comp }} out/raw --sequence --frames=${{ matrix.a }}-${{ matrix.b }} --image-format=jpeg --jpeg-quality=95 --scale=$scale --gl=swangle --concurrency=1 --timeout=300000 --log=info
+          mkdir -p out/hook
+          python3 - <<'PY'
+          import os, re
+          for f in os.listdir("out/raw"):
+              m = re.search(r"(\d+)\.jpe?g$", f)
+              if m: os.rename(f"out/raw/{f}", f"out/hook/hook_{int(m.group(1)):03d}.jpg")
+          print(len(os.listdir("out/hook")), "frames")
+          PY
+          echo "render seconds: $(( $(date +%s) - start ))" | tee out/hook/_time_${{ matrix.i }}.txt
+      - name: Upload 3D frames
+        run: |
+          tar -c -C out/hook . | gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 3 --symmetric --cipher-algo AES256 -o hook-${{ matrix.i }}.tar.gpg 3<<<"$ASSETS_KEY"
+          gh release upload "$TAG" hook-${{ matrix.i }}.tar.gpg --clobber -R "$GITHUB_REPOSITORY"
+
+  chunk:
+    needs: [plan, hook]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack the encrypted assets
+        run: gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 3 -d assets.tar.gpg 3<<<"$ASSETS_KEY" | tar x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 3D frames (this run, or the run in hook_run)
+        run: |
+          SRC="$TAG"; [ -n "${{ inputs.hook_run }}" ] && SRC="run-${{ inputs.hook_run }}"
+          mkdir -p dl public/hook
+          gh release download "$SRC" -p 'hook-*.tar.gpg' -D dl -R "$GITHUB_REPOSITORY"
+          for f in dl/*.tar.gpg; do gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 3 -d "$f" 3<<<"$ASSETS_KEY" | tar -x -C public/hook; done
+          rm -rf dl
+          n=$(ls public/hook | grep -c jpg); echo "$n 3D frames"
+          # a missing hook job must stop the film here, not render a still picture (run 42673621240 had 20 of 43 chunks)
+          [ -n "${{ inputs.upto }}" ] || [ "$n" -ge "${{ inputs.hook_frames }}" ] || { echo "missing 3D frames: $n of ${{ inputs.hook_frames }}"; exit 1; }
+      - name: Cache ffmpeg
+        id: ff
+        uses: actions/cache@v4
+        with:
+          path: ~/ff
+          key: ffmpeg-static-v1
+      - name: ffmpeg (static build) + numpy/opencv
+        timeout-minutes: 8
+        run: |
+          if [ "${{ steps.ff.outputs.cache-hit }}" != "true" ]; then
+            mkdir -p ~/ff
+            # in a subshell: a bare cd would leave the rest of the step outside the checkout
+            (cd ~/ff && curl -fsSL --retry 6 --retry-all-errors --retry-delay 5 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | tar xJ --strip-components=1)
+          fi
+          echo "$HOME/ff/bin" >> "$GITHUB_PATH"
+          python3 -m pip install --quiet --break-system-packages numpy opencv-python-headless
+          ls public/hook | grep -c jpg
+          $CHROME --version
+      - name: Render frames ${{ matrix.a }}-${{ matrix.b }}
+        env:
+          # local bloom: only what is brighter than its surroundings glows (v1's fixed 175 threshold bloomed the whole
+          # paper / lime grounds to white and washed the words on them out)
+          BLOOM_LOCAL: "1"
+          BLOOM: "0.6"
+        run: |
+          mkdir -p out
+          dsf=$(case "${{ inputs.res }}" in 540) echo 0.5;; *) echo 1;; esac)
+          python3 kinetic/scripts/post.py $dsf ${{ matrix.a }} ${{ matrix.b }} out/part_$(printf %02d ${{ matrix.i }}).mp4 60
+      - name: Upload part
+        run: |
+          P=out/part_$(printf %02d ${{ matrix.i }}).mp4
+          gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 3 --symmetric --cipher-algo AES256 -o "$P.gpg" "$P" 3<<<"$ASSETS_KEY"
+          gh release upload "$TAG" "$P.gpg" --clobber -R "$GITHUB_REPOSITORY"
+
+  join:
+    needs: chunk
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack the encrypted assets
+        run: gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 3 -d assets.tar.gpg 3<<<"$ASSETS_KEY" | tar x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Download parts
+        run: |
+          mkdir -p parts
+          gh release download "$TAG" -p 'part_*.mp4.gpg' -D parts -R "$GITHUB_REPOSITORY"
+          for f in parts/*.gpg; do gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 3 -d "$f" 3<<<"$ASSETS_KEY" > "${f%.gpg}"; rm "$f"; done
+      - name: Cache ffmpeg
+        id: ff
+        uses: actions/cache@v4
+        with:
+          path: ~/ff
+          key: ffmpeg-static-v1
+      - name: ffmpeg (static build) + numpy/opencv
+        timeout-minutes: 8
+        run: |
+          if [ "${{ steps.ff.outputs.cache-hit }}" != "true" ]; then
+            mkdir -p ~/ff
+            # in a subshell: a bare cd would leave the rest of the step outside the checkout
+            (cd ~/ff && curl -fsSL --retry 6 --retry-all-errors --retry-delay 5 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | tar xJ --strip-components=1)
+          fi
+          echo "$HOME/ff/bin" >> "$GITHUB_PATH"
+          python3 -m pip install --quiet --break-system-packages numpy opencv-python-headless
+      - name: Join, mux, checks, scene stills
+        env:
+          END_CARD: ${{ inputs.end_card }}
+        run: |
+          mkdir -p out/stills out/guides
+          node kinetic/scripts/cdp.mjs info info.json
+          ls parts/*.mp4 | sort | sed "s|^|file '$PWD/|; s|$|'|" > list.txt
+          ffmpeg -v error -y -f concat -safe 0 -i list.txt -c copy video.mp4
+          if [ -n "${{ inputs.upto }}" ]; then
+            ffmpeg -v error -y -i video.mp4 -i $AUDIO -map 0:v -map 1:a -c:v copy -c:a aac -b:a 320k -shortest -movflags +faststart out/${NAME}_preview_${{ inputs.res }}.mp4
+          else
+            CK=out/checks_${{ inputs.res }}.txt
+            # every verdict goes into the checks file; a failed gate must not stop the upload
+            python3 kinetic/scripts/finish916.py video.mp4 $AUDIO info.json out $NAME 2>&1 | tee $CK || true
+            MP4=$(ls out/${NAME}_*p60.mp4 | head -1)
+            echo "== tools/qa_gates.py" | tee -a $CK
+            python3 tools/qa_gates.py "$MP4" --frames 1107 --end-card ${{ inputs.end_card }} --guides 0,1.2,2.2,3.4,4.0,5.2,6.0,6.9,7.4,8.1,8.7,9.5,10.4,11.3,12.4,13.3,14.0,14.5,15.5,16.4,17.2,18.3 --out out/guides --json out/qa_gates.json 2>&1 | tee -a $CK || true
+            echo "== cdp.mjs check (captions, 170 px)" | tee -a $CK
+            node kinetic/scripts/cdp.mjs check out/text_check.json 0.1 170 2>&1 | tee -a $CK || true
+            echo "== check_text3d.py (3D words)" | tee -a $CK
+            python3 check_text3d.py 2>&1 | tee -a $CK || true
+            cp logs/text3d_check.json out/ 2>/dev/null || true
+          fi
+          # one still per scene (timing.ts), 540x960
+          for t in 0.000 0.300 0.700 1.000 1.300 1.700 2.200 2.800 3.450 4.000 4.600 5.200 5.800 6.300 6.700 6.950 7.400 7.800 8.100 8.700 9.300 9.800 10.150 10.600 11.000 11.300 11.700 12.100 12.450 12.700 13.300 13.650 13.900 14.100 14.500 15.000 15.600 16.200 17.000 18.000 18.400; do
+            ffmpeg -v error -y -ss $t -i video.mp4 -frames:v 1 -vf scale=540:960 -q:v 3 out/stills/s_${t}.jpg || true
+          done
+      - name: Upload result
+        if: always()
+        run: |
+          tar -c -C out . | gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 3 --symmetric --cipher-algo AES256 -o ${NAME}-${{ inputs.res }}.tar.gpg 3<<<"$ASSETS_KEY"
+          gh release upload "$TAG" ${NAME}-${{ inputs.res }}.tar.gpg --clobber -R "$GITHUB_REPOSITORY"
